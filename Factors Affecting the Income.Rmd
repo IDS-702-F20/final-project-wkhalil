@@ -1,0 +1,525 @@
+---
+title: "Final Project: Factors Affecting the Income"
+author: "Yuwei Zhang"
+header-includes:
+  - \usepackage{leading}
+  - \leading{13pt}
+geometry: "left=1.2cm,right=1.2cm,top=1cm,bottom=2cm"
+fontsize: 10.5pt
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+## Summary
+Income inequality in the United States kept rising in recent years and there are many factors that may have an impact on income, like age, education level, gender, etc. The question naturally arises: **What are the most influential factors in the income of American adults?** That’s the goal of this study, which is **inference based**. In addition, I’m also interested in the odds ratio of over $50k annual income **differs by one's age or across native countries.**
+<br />
+**EDA** was conducted to check the association of each predictor variable with the **response variable, whether the annual income exceeds 50k**, and highlighted the preliminary concerns based on the results of the EDA.
+**Box plots and binned plots** were used to analyze the association between the **binary response variable with each numeric predictor variable**, and **tables** were used to analyze the associations between the **binary response variables with each categorical predictor variable**. Chi-square test is used to compare the deviance of models with and without predictors. VIF is used to check multicollinearity and eliminate redundant variables.
+The **potential interactions** of the variables are explored to identify differences in data trends for different groups of predictors. **Data modeling and model assessment** are conducted to identify the optimal model to answer key interests. In addition, binned residual plots were used to verify the **assumptions of the final regression model**.
+<br />
+Below are important results from the study (more detailed explanation will be provided in Model and Conclusion sections):
+The outcome of the study shows **age, sex, family relationship, weekly working hour and its square, education level, occupation and native country are all significant predictors** that have an impact on income. People are **less likely to have over 50k income** if age changes from ‘young’ to **‘middle’ or ‘old’**, but **more likely to have over 50k income** if age changes from ‘young’ to **‘senior’**. It seems **‘senior’ age are most likely to have a high income**. Furthermore, there are also **interactions of age by relationship and age by weekly working hours**.
+
+
+## Introduction
+<br />
+To analyze the income factors, the relevant data of US Adult Census Income data in 1994 was used, which is obtained from the UCI Machine Learning Repository. The questions I focused on are:
+
+<br />
+**Q1: What are the main factors that have an impact on income? **
+
+<br />
+**Q2: Are people more likely to have an annual income of over $50K annual income with larger age? **
+
+<br />
+**Q3: Did the overall odds of over 50k annual income differ by native country?**
+
+<br />
+**Q4: Are there any other relationships with the odds of over $50K annual income? **
+
+```{r setup, include=FALSE}
+rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(ggplot2)
+library(skimr)
+library(xtable)
+library(rms) #for VIF
+library(MASS)
+library(pander)
+library(arm)
+library(pROC)
+# library(e1071)
+library(caret)
+require(gridExtra)
+library(lme4)
+library(rstan)
+library(brms)
+library(sjPlot) #another option for making nice html tables
+library(lattice) #for ranef
+library(dplyr)
+library(kableExtra)
+library(MatchIt) #for propensity score matching
+library(cobalt)
+# tinytex::install_tinytex()
+```
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+set.seed(702)
+Data <- read.table("http://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data", sep=",", header=F, col.names=c("age", "type_employer", "fnlwgt", "education", "education_num", "marital", "occupation", "relationship", "race", "sex", "capital_gain", "capital_loss", "hr_per_week", "country", "income"), fill=FALSE, strip.white=T)
+
+Data <-na.omit(Data)
+Data$income_50k <- 1
+Data$income_50k[Data$income =='<=50K'] <- 0
+Data$income <- as.factor(Data$income)
+# dim(Data)
+# table(Data$income)  # 24720  7841
+```
+
+<br />
+The raw data has **32,561 observations** in total. Consistent with the fact that people with high income are in the minority, the number of those who have annual income is > \$50k is 7,841, while  <=$50k is 24,720. A small amount of data has missing values in both 'type_employer' and 'occupation', I only kept the ones with complete observations for variables I'm interested in.
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# eliminate missing ? and Without-pay
+df <- Data[!Data$country %in% c("?",'Holand-Netherlands') & Data$occupation != "?" & !Data$type_employer %in% c('Without-pay','Never-worked') & Data$age>17  & Data$age <= 80,]
+
+# adjust education levels
+df <- df[, !names(df) %in% c("marital", "education_num")]
+df$education[df$education %in% c('1st-4th', '5th-6th', '7th-8th', '9th', '10th', '11th', '12th', 'Preschool')] <- 'No HS-grad'
+df$education[df$education %in% c('Prof-school','Doctorate','Masters')] <- 'Masters+'
+df$education[df$education %in% c('Assoc-acdm','Assoc-voc','Some-college')] <- 'College'
+
+# transfer capital gains and loss
+df$diff <- df$capital_gain-df$capital_loss
+df <- df[, !names(df) %in% c("capital_gain", "capital_loss")]
+
+# marital status
+df$relationship[df$relationship %in% c("Husband","Wife")] <- 'Married'
+df$relationship[df$relationship  %in% c("Not-in-family","Other-relative")] <- 'Unmarried'
+
+# categorical ages
+df$age_fac <- cut(df$age, c(0,25,45,65,100), labels = c('young', 'middle','senior','old'), ordered=T)
+df$age_cen <- df$age - mean(df$age)
+df$age_2 <- df$age_cen^2
+
+# center numeric variables
+df$hr_per_week <- df$hr_per_week - mean(df$hr_per_week)
+# eliminate extremely large work hours
+df <- df[df$hr_per_week < 40, ]
+df$hour_2 <- df$hr_per_week^2
+df$diff <- df$diff - mean(df$diff)
+```
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+df$income <- df$income_50k
+df$income <- as.factor(df$income)
+# df$income <- factor(df$income_50k, levels = c(0,1), labels = c('<=50k', '>50k'))
+names <- c('age_fac','education','occupation','relationship', 'race', 'sex','country')
+df[, names] <-lapply(df[,names], factor)
+
+# str(df)
+# table(df$income)
+```
+
+<br />
+The response variable is ‘income’, which is categorized into **binary as '<=50k' and '>50k'**, denoted as 0 and 1 respectively.
+
+<br />
+At the beginning, there are 15 predictor variables, among which categorical ones are 'type_employer', 'education', 'marital', 'occupation', 'relationship', 'race', 'sex', 'country' and numeric ones are 'age', 'fnlwgt', 'education_num', 'capital_gain', 'capital_loss', 'hr_per_week.'.
+Some of the predictor variables are telling the same story, thus only the more representative ones were kept. Both 'type_employer' and 'occupation' indicate the job type and **‘occupation’ was kept** for being more detailed. **Education-related** variables 'education' and 'education_num' are concluded as **5 levels** according to different education stages ('No HS-grad': without high school diploma, 'HS-grad': with high school diploma, 'College': with associate or college degree, 'Bachelors': with Bachelor's degree, 'Masters+': with master or higher degree). 'Marital' and 'relationship' both indicate the **family status, only the 'relationship' was kept**. Furthermore, the level "Husband" and "Wife" in  'relationship' are merged into 'Married', while level "Not-in-family" and "Other-relative" were merged into 'Unmarried'.
+
+<br />
+Numeric predictors were also preprocessed. As I mainly focused on the adult income, only the observations with age between 17 and 80 are kept, and the ones **who don’t have income are excluded**, that is, 'Without-pay', 'Never-worked' for 'type_employer'. The relationship between age and income is not linear, which is more like an S-curve. Compared to the square of age, **categorizing age** into **'young', 'middle', 'senior' and 'old'** could build a better model. The ‘capital_gain’ and ‘capital_loss’ are summed up as differences in the capital, denoted as 'diff'.
+
+<br />
+So far, **categorical predictors** are **"age","education","occupation","relationship","race","sex", "country"**. **Numeric predictors** are **"diff","fnlwgt","hr_per_week"**, which are all centered. 
+
+
+## DATA
+The table of response variable ‘income_50k’ shows that 24,720 observations have an income less than 50k while 7,841 observations have an income greater than 50k. The negative observations are approximately 24% of all observations, which is still within a reasonable scale.
+
+### response variables
+The binned plot of ‘hr_per_week’ against income shows a quadratic trend. Thus transformation is conducted, the binned residual plot is almost random after adding the quadratic term of working hours, demoted as ‘hour_2’
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# response ~ numeric
+# response ~ hr_per_week   significant
+# ggplot(df,aes(x=income, y=hr_per_week, fill=income)) +
+#   geom_boxplot() + coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="hr_per_week",
+#        x="income ",y="hr_per_week") +
+#   theme_classic() + theme(legend.position="none")
+# 
+# binnedplot(y=df$income_50k,df$hr_per_week,xlab="hr_per_week",ylim=c(0,1),col.pts="navy",cex.axis = 0.7, cex.lab= 1.2,
+#            ylab ="income > 50k?",main="Binned hr_per_week and income",col.int="white")
+
+model_hour <- glm(income_50k ~ hr_per_week+ diff + age_fac + education + relationship + sex + occupation, data=df, family = binomial)
+rawresid_h <- residuals(model_hour,"resp")
+binnedplot(x=df$hr_per_week,y=rawresid_h,xlab="hr_per_week",cex.axis = 0.7, cex.lab= 1.2,
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+
+model_hour_2 <- glm(income_50k ~ hour_2 + diff + age_fac + education + relationship + sex + occupation, data=df, family = binomial)
+rawresid_hour_2 <- residuals(model_hour_2,"resp")
+binnedplot(x=df$hour_2,y=rawresid_hour_2,xlab="hour_2", cex.axis = 0.7, cex.lab= 1.2,
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+```
+
+From the boxplot of capital difference 'diff' against income, the quantiles are all 0 with a few outliers, which is reasonable as most observations have 0 capital_gain nor have capital_loss. There’s one **outlier who has an extremely large capital gain ($100,000)** compared to all other observations and was **dropped**.
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# response ~ diff
+# ggplot(df,aes(x=income, y=diff, fill=income)) +
+#   geom_boxplot() + #coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="capital gain&loss",
+#        x="income ",y="capital gain&loss") +
+#   theme_classic() + theme(legend.position="none")
+# 
+# # drop the outlier with extremely large capital difference
+# df <- df[df$diff<50000,]
+```
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# # response ~ age_cen
+# ggplot(df,aes(x=income, y=age_cen, fill=income)) +
+#   geom_boxplot() + coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="age_cen",
+#        x="income ",y="age") +
+#   theme_classic() + theme(legend.position="none")
+# model_age_cen <- glm(income_50k ~ hr_per_week+ diff + age_cen + education + relationship + sex + occupation, data=df, family = binomial)
+# rawresid_age_cen <- residuals(model_age_cen,"resp")
+# binnedplot(x=df$age_cen,y=rawresid_age_cen,xlab="age",
+#            col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+# 
+# # response ~ age_2
+# ggplot(df,aes(x=income, y=age_2, fill=income)) +
+#   geom_boxplot() + coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="age_2",
+#        x="income ",y="age_2") +
+#   theme_classic() + theme(legend.position="none")
+# model_age_2 <- glm(income_50k ~ hr_per_week+ diff + age_cen + age_2 + education + relationship + sex + occupation, data=df, family = binomial)
+# rawresid_age_2 <- residuals(model_age_2,"resp")
+# binnedplot(x=df$age_2,y=rawresid_age_2,xlab="age",
+#            col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+```
+
+The boxplot of census generated variable 'fnlwgt' against income showed almost no difference, thus 'fnlwgt' was eliminated.
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# response ~ fnlwgt
+# ggplot(df,aes(x=income, y=fnlwgt, fill=income)) +
+#   geom_boxplot() + #coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="fnlwgt",
+#        x="income ",y="fnlwgt") +
+#   theme_classic() + theme(legend.position="none")
+# binnedplot(y=df$income_50k,df$fnlwgt,xlab="diff",ylim=c(0,1),col.pts="navy",
+#            ylab ="income > 50k?",main="Binned fnlwgt and income",col.int="white")
+```
+
+As for categorical predictors, table and chi-test are used to estimate the relationship. It turns out that **all categorical variables** have a corresponding p-value much smaller than .05, indicating **some correlation with the response variable**. Some **native countries** with few observations could borrow information from other native countries, but 'Holand-Netherlands' was dropped for only one observation.
+
+<br />
+To check the multicollinearity, a basic logistic regression model was conducted with all predictors. The VIF of white race and black race were both larger than 10, thus the race is eliminated from the predictors.
+
+```{r, echo=FALSE, out.width="60%", warning=FALSE, message=FALSE}
+# eda_model <- glm(income_50k ~ hr_per_week + hour_2 + diff + age_fac + education + 
+#                      relationship + race + sex + occupation + country, 
+#            data=df, family=binomial)
+# summary(eda_model)
+# vif(eda_model)
+```
+
+<br />
+The ‘country’ indicating **native country** brings some **hierarchical features** and wass added into the model as a **random intercept**. Thus numeric predators ‘hr_per_week’, ‘diff’, and all categorical variables except for ‘country’ were included in our model.  
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# factor
+# age_fac significant  p-value < 2.2e-16
+# pander(apply(table(df[,c("income","age_fac")])/sum(table(df[,c("income","age_fac")])),
+#       2,function(x) x/sum(x)))
+# chisq.test(table(df[,c("income","age_fac")]))
+
+# type_employer occupation significant   p-value = 1.06e-08
+# pander(apply(table(df[,c("income","type_employer")])/sum(table(df[,c("income","type_employer")])),
+#       2,function(x) x/sum(x)))
+# chisq.test(table(df[,c("income","type_employer")]))
+# p-value < 2.2e-16
+
+# pander(apply(table(df[,c("income","occupation")])/sum(table(df[,c("income","occupation")])),
+#       2,function(x) x/sum(x)))
+# chisq.test(table(df[,c("income","occupation")]))
+# 
+# # education significant  p-value < 2.2e-16
+# pander(apply(table(df[,c("income","education")])/sum(table(df[,c("income","education")])),
+#       2,function(x) x/sum(x)))
+# chisq.test(table(df[,c("income","education")]))
+# 
+# # relationship significant   p-value < 2.2e-16
+# pander(apply(table(df[,c("income","relationship")])/sum(table(df[,c("income","relationship")])),
+#       2,function(x) x/sum(x)))
+# chisq.test(table(df[,c("income","relationship")]))
+# 
+# # race significant   < 2.2e-16
+# pander(apply(table(df[,c("income","race")])/sum(table(df[,c("income","race")])),
+#       2,function(x) x/sum(x)))
+# chisq.test(table(df[,c("income","race")]))
+# 
+# # sex significant    p-value < 2.2e-16
+# pander(apply(table(df[,c("income","sex")])/sum(table(df[,c("income","sex")])),
+#       2,function(x) x/sum(x)))
+# chisq.test(table(df[,c("income","sex")]))
+# 
+# # country significant    p-value < 2.2e-16
+# pander(apply(table(df[,c("income","country")])/sum(table(df[,c("income","country")])),
+#       2,function(x) x/sum(x)))
+# chisq.test(table(df[,c("income","country")]))
+```
+
+
+### interactions
+Box plots and tables are used to identify the **potential interactions** between two predictors versus ratio. Due to the length limitation of the report, only the interesting and important interaction findings are highlighted. There are 5 potential interactions: **age by relationship, age by education, age by occupation, age by hr_per_week, sex by education**. To determine the significance of those interactions, **anova tests** were later conducted during model fitting.
+
+```{r, echo=FALSE, out.width="50%", warning=FALSE, message=FALSE,error=FALSE,fig.align='center'}
+# interaction between hr_per_week by age_fac
+ggplot(df,aes(x=income, y=hr_per_week, fill=income)) +
+  geom_boxplot() + coord_flip() +
+  scale_fill_brewer(palette="Reds") +
+  labs(title="hr_per_week",
+       x="income ",y="hr_per_week") +
+  theme_classic() + theme(legend.position="none") + facet_wrap( ~ age_fac,ncol=2)
+
+# interaction between hr_per_week by occupation
+# ggplot(df,aes(x=income, y=hr_per_week, fill=income)) +
+#   geom_boxplot() + coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="hr_per_week",
+#        x="income ",y="hr_per_week") +
+#   theme_classic() + theme(legend.position="none") + facet_wrap( ~ occupation,ncol=4)
+
+# interaction between hr_per_week by education no
+# ggplot(df,aes(x=income, y=hr_per_week, fill=income)) +
+#   geom_boxplot() + coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="hr_per_week",
+#        x="income ",y="hr_per_week") +
+#   theme_classic() + theme(legend.position="none") + facet_wrap( ~ education,ncol=3)
+
+# gage_2 & relationship
+# ggplot(df,aes(x=income, y=age_2, fill=income)) +
+#   geom_boxplot() + coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="age_2",
+#        x="income ",y="age_2") +
+#   theme_classic() + theme(legend.position="none") + facet_wrap( ~ relationship,ncol=4)
+
+# age_2 by occupation  不明显
+# ggplot(df,aes(x=income, y=age_2, fill=income)) +
+#   geom_boxplot() + coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="age_2",
+#        x="income ",y="age_2") +
+#   theme_classic() + theme(legend.position="none") + facet_wrap( ~ occupation,ncol=4)
+
+# age_2 by education
+# ggplot(df,aes(x=income, y=age_2, fill=income)) +
+#   geom_boxplot() + coord_flip() +
+#   scale_fill_brewer(palette="Reds") +
+#   labs(title="age_2",
+#        x="income ",y="age_2") +
+#   theme_classic() + theme(legend.position="none") + facet_wrap( ~ education,ncol=4)
+```
+
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# # interaction between age_fac & relationship
+# apply(table(df[df$age_fac=='young',][,c("income","relationship")])/sum(table(df[df$age_fac=='young',][,c("income","relationship")])),2,function(x) x/sum(x))
+# apply(table(df[df$age_fac=='middle',][,c("income","relationship")])/sum(table(df[df$age_fac=='middle',][,c("income","relationship")])),2,function(x) x/sum(x))
+# apply(table(df[df$age_fac=='senior',][,c("income","relationship")])/sum(table(df[df$age_fac=='senior',][,c("income","relationship")])),2,function(x) x/sum(x))
+# apply(table(df[df$age_fac=='old',][,c("income","relationship")])/sum(table(df[df$age_fac=='old',][,c("income","relationship")])),2,function(x) x/sum(x))
+# 
+# # interaction between age_fac & education
+# pander(apply(table(df[df$age_fac=='young',][,c("income","education")])/sum(table(df[df$age_fac=='young',][,c("income","education")])),2,function(x) x/sum(x)))
+# pander(apply(table(df[df$age_fac=='middle',][,c("income","education")])/sum(table(df[df$age_fac=='middle',][,c("income","education")])),2,function(x) x/sum(x)))
+# pander(apply(table(df[df$age_fac=='senior',][,c("income","education")])/sum(table(df[df$age_fac=='senior',][,c("income","education")])),2,function(x) x/sum(x)))
+# pander(apply(table(df[df$age_fac=='old',][,c("income","education")])/sum(table(df[df$age_fac=='old',][,c("income","education")])),2,function(x) x/sum(x)))
+# 
+# # interaction between age_fac & occupation
+# apply(table(df[df$age_fac=='young',][,c("income","occupation")])/sum(table(df[df$age_fac=='young',][,c("income","occupation")])),2,function(x) x/sum(x))
+# apply(table(df[df$age_fac=='middle',][,c("income","occupation")])/sum(table(df[df$age_fac=='middle',][,c("income","occupation")])),2,function(x) x/sum(x))
+# apply(table(df[df$age_fac=='senior',][,c("income","occupation")])/sum(table(df[df$age_fac=='senior',][,c("income","occupation")])),2,function(x) x/sum(x))
+# apply(table(df[df$age_fac=='old',][,c("income","occupation")])/sum(table(df[df$age_fac=='old',][,c("income","occupation")])),2,function(x) x/sum(x))
+# 
+# 
+# # interaction between education & occupation
+# apply(table(df[df$education=='No HS-grad',][,c("income","occupation")])/sum(table(df[df$education=='No HS-grad',][,c("income","occupation")])),2,function(x) x/sum(x))
+# apply(table(df[df$education=='HS-grad',][,c("income","occupation")])/sum(table(df[df$education=='HS-grad',][,c("income","occupation")])),2,function(x) x/sum(x))
+# apply(table(df[df$education=='College',][,c("income","occupation")])/sum(table(df[df$education=='College',][,c("income","occupation")])),2,function(x) x/sum(x))
+# apply(table(df[df$education=='Bachelors',][,c("income","occupation")])/sum(table(df[df$education=='Bachelors',][,c("income","occupation")])),2,function(x) x/sum(x))
+# apply(table(df[df$education=='Masters+',][,c("income","occupation")])/sum(table(df[df$education=='Masters+',][,c("income","occupation")])),2,function(x) x/sum(x))
+# 
+# #interaction between education & sex
+# pander(apply(table(df[df$sex=='Male',][,c("income","education")])/sum(table(df[df$sex=='Male',][,c("income","education")])),2,function(x) x/sum(x)))
+# pander(apply(table(df[df$sex=='Female',][,c("income","education")])/sum(table(df[df$sex=='Female',][,c("income","education")])),2,function(x) x/sum(x)))
+# 
+# # interaction between education & race
+# pander(apply(table(df[df$education=='No HS-grad',][,c("income","race")])/sum(table(df[df$education=='No HS-grad',][,c("income","race")])),2,function(x) x/sum(x)))
+# apply(table(df[df$education=='HS-grad',][,c("income","race")])/sum(table(df[df$education=='HS-grad',][,c("income","race")])),2,function(x) x/sum(x))
+# apply(table(df[df$education=='College',][,c("income","race")])/sum(table(df[df$education=='College',][,c("income","race")])),2,function(x) x/sum(x))
+# apply(table(df[df$education=='Bachelors',][,c("income","race")])/sum(table(df[df$education=='Bachelors',][,c("income","race")])),2,function(x) x/sum(x))
+# apply(table(df[df$education=='Masters+',][,c("income","race")])/sum(table(df[df$education=='Masters+',][,c("income","race")])),2,function(x) x/sum(x))
+```
+At the end of EDA, there are 29,347 remaining observations after dropping out the outliers and some predictors.
+
+## Model
+Based on the EDA results, the preliminary model was constructed with predictor variables: **'hr_per_week', ‘hour_2’, 'diff', 'age', 'education', 'relationship', 'sex' and 'occupation'**. Since the **response variable ‘income_50k’ is categorical ('<=50k' and '>50k')**, it's suitable to use the **logistic regression** to fit the income levels. As discussed above, **‘country’ brings some hierarchical features**, thus a **multilevel model** was adopted to better explain the data with the random intercept of the native country.
+
+<br />
+The summary of the preliminary model showed that predictor variables 'hr_per_week', ‘hour_2’, 'diff', 'age_fac', 'education', 'relationship', 'sex' and 'occupation'  all have significant relationship with response variable. The **standard deviation of random intercept ‘country’ was 0.37**, indicating **some variation explained by native countries**. The dotplot proved that the overall odds of income over 50k differs by native countries.
+
+
+```{r, echo=FALSE, out.width="60%", warning=FALSE, message=FALSE}
+# model_pre <- glmer(income_50k ~ hr_per_week + hour_2 + diff + age_fac + education + 
+#                      relationship + sex + occupation + (1|country),
+#                    family=binomial(link="logit"), data=df)
+# summary(model_pre)
+# 
+# dotplot(ranef(model_pre, condVar=TRUE), axis.text = element_text(size=8), axis.title = element_text(size=20))$country
+# (ranef(model_pre)$country)["India",]
+```
+
+Then, the **potential interactions** from EDA were checked by **anova test**. There were 2 interactions having p-value smaller than .05 and were added into the final model. The remaining 2 significant interactions were both related to age, they were **age by relationship** and **age by weekly working hours**.
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# check for interactions
+# age_fac:relationship   0.000426 ****
+# model_1 <- glmer(income_50k ~ hr_per_week + hour_2 + diff +age_fac+education + relationship+
+#                     sex + occupation + (1|country) + age_fac:relationship,
+#                  family=binomial(link="logit"), data=df)
+# anova(model_pre, model_1)
+# 
+# # age_fac:education    0.1444
+# model_2 <-glmer(income_50k ~ hr_per_week + hour_2 + diff +age_fac+education + relationship+ 
+#                     sex + occupation + (1|country) + age_fac:relationship + age_fac:education,
+#                 family=binomial(link="logit"), data=df)
+# anova(model_1, model_2)
+# 
+# # age_fac:occupation   0.02836 **
+# model_3 <- glmer(income_50k ~ hr_per_week + hour_2 + diff +age_fac+education + relationship+
+#                     sex + occupation + (1|country) + age_fac:relationship + age_fac:occupation,
+#                  family=binomial(link="logit"), data=df)
+# anova(model_1, model_3)
+# 
+# # hr_per_week:age_fac    0.008935 **
+# model_4 <- glmer(income_50k ~ hr_per_week + hour_2 + diff +age_fac+education + relationship+ 
+#                    sex + occupation + (1|country) + age_fac:relationship + age_fac:occupation + 
+#                    hr_per_week:age_fac,family=binomial(link="logit"), data=df)
+# anova(model_3, model_4)
+# 
+# # education:sex   1
+# model_5 <- glmer(income_50k ~ hr_per_week + hour_2 + diff +age_fac+education + relationship+ 
+#                    sex + occupation + (1|country)  + age_fac:relationship + age_fac:occupation + 
+#                    hr_per_week:age_fac + education:sex,family=binomial(link="logit"), data=df)
+# anova(model_4, model_5)
+
+# education:race   0.1006
+# model_6 <- glmer(income_50k ~ hr_per_week + hour_2 + diff +age_fac+education + relationship+ 
+#                    sex + occupation + (1|country)  + age_fac:relationship + age_fac:occupation + 
+#                    hr_per_week:age_fac + education:race,family=binomial(link="logit"), data=df)
+# anova(model_4, model_6)
+```
+
+### final model
+Based on above work, we finalized our model as:
+
+$$
+\begin{split}
+log(\frac{\pi_{ij}}{1-\pi_{ij}}) &= (\beta_{0}+\gamma_{0j}) + \beta_{1}age\_fac_{ij} + \beta_{2}sex_{ij} + 
+\beta_{3}relationship_{ij} + \beta_{4}hr\_per\_week_{ij} + \beta_{5}hour\_2_{ij}+\beta_{6}diff_{ij} \\ 
++ &\beta_{7}education_{ij}+ \beta_{8}occupation_{ij} + 
+\beta_{9}age\_fac:relationship_{ij} + \beta_{10}age\_fac:hr\_per\_week_{ij} + \epsilon_{ij}\\
+& where\space \pi_{ij}=income\space over \space 50k,\space \epsilon_{ij}\sim N(0,\sigma^{2}),\space\gamma_{0j} 
+\sim N(0,\tau_{0}^{2})
+\end{split}
+$$
+The predictors for final model are 'hr_per_week', ‘hour_2’, 'diff', 'age_fac', 'education', 'relationship', 'sex' and 'occupation'. With 2 interactions age by relationship and age by weekly working hours, plus random intercept of native countries.
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE}
+# final model
+
+model_final <- glmer(income_50k ~ age_fac + sex + relationship + hr_per_week + hour_2 + diff + education + 
+                   occupation + (1|country) + age_fac:relationship +  hr_per_week:age_fac,
+                   family=binomial(link="logit"), data=df)
+
+# summary(model_final)
+```
+
+### model validation
+Binned residual plots were plotted to validate our model. The points in binned residual plots are almost randomly distributed, thus the random assumption is well suited. Few points are out of the 95% bands and the model is well fitted. 
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE,error=FALSE, out.width="50%",fig.align='center'}
+# binned plot
+rawresid1 <- residuals(model_final,"resp")
+
+#binned residual plots
+binnedplot(x=fitted(model_final),y=rawresid1,xlab="Pred. probabilities",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+#looks good
+
+# binnedplot(x=df$hr_per_week,y=rawresid1,xlab="hr_per_week",
+#            col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+
+binnedplot(x=df$hour_2,y=rawresid1,xlab="hour_2",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+
+```
+To check the model's performance on data,we plot confusion matrix and ROC curve. The sensitivity and specificity of the model are 0.58 and 0.93 respectively, with a high AUC of 0.895, indicating the model is well fitted.
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE,error=FALSE}
+# Conf_mat <- confusionMatrix(as.factor(ifelse(fitted(model_final) >= 0.5, "1","0")),
+#                             as.factor(df$income_50k),positive = "1")
+# Conf_mat$table
+# Conf_mat$overall["Accuracy"];
+# Conf_mat$byClass[c("Sensitivity","Specificity")]
+# 
+# #look at ROC curve
+# roc(df$income_50k,fitted(model_final),plot=T,legacy.axes=T,
+#     print.auc =T,col="red3")
+```
+
+## Conclusion
+```{r, echo=FALSE, warning=FALSE, message=FALSE,error=FALSE}
+# tab_model(model_final)
+coeff1 <-c('intercept', 'age[middle]', 'age[senior]','age[old]', 'age[mid]:relationshipOwn-child', 'age[sen]:relationshipOwn-child',
+                 'age[old]:relationshipOwn-child','age[mid]:relationshipUnmarried', 'age[sen]:relationshipUnmarried',
+                 'age[old]:relationshipUnmarried', 'age[mid]:hr_per_week', 'age[sen]:hr_per_week',
+                 'age[old]:hr_per_week')
+val1 <- c(0.73, 2.28, 0.33, 0.98, 0.00, 0.00, 0.7, 2.19, 1.26, 1.1, 0.96, 1.02, 0.99)
+
+coeff2 <- c('sex', 'relationshipOwn-child', 'relationshipUnmarried', 'hr_per_week', 'diff',
+            'education[College]','education[HS-grad]','education[Masters+]','education[No HS-grad]',
+            'occupation[Exec-managerial]', 'occupation[Prof-specialty]', 'occupation[Tech-support]', 'occupation[Farming-fishing]')
+val2 <- c(1.20, 0.00, 0.12,1.04, 1.00, 1.00, 0.49, 0.33, 1.73, 0.15, 2.05, 1.81, 0.31)
+
+summary1 <- data.frame(coeff1, val1, coeff2, val2)
+colnames(summary1) <- c('Predictors','Odds ratio','Predictors','Odds ratio')
+knitr::kable(summary1, "simple")
+```
+
+According to the summary of our final model, all individual predictors have p-value smaller than .05 and have significant relationship with response variable ‘income_50k’.**The individual predictors in final model are all main factors that have an impact on income (Q1)**. The baseline intercept of the final model shows that a young married female from India with bachelor’s degree who works for 0 hour a week as a clerk and has 0 capital income has the odds of over 50k income be 0.72. 
+
+The odds of over 50k income would **increase by 128% (confidence interval 74%-198%)if the age changes from ‘young’ to ‘middle’**, with all other variables constant. But if the age changes from **‘young’ to ‘senior’ or ‘old’, the odds of over 50k income would decrease by 67% (confidence interval 59%-73%) and 2% (confidence interval -9%-12%)**. Thus the **odds of over 50k income would first increase and then decrease with larger age (Q2)**.
+**On top of the effect of age, the interactions related to age also have an impact on income.**
+According to the **interaction of age by relationship**, the odds of over 50k income differ with different education levels. If a married one who has ‘middle’ age changes to have a child, the odds of over 50k income would decrease by 100%, while changes to unmarried would increase the odds by 119%. For **interaction of age by weekly working hours**, if the baseline has already changed into ‘middle’ age, the one unit increase in weekly working hours would decrease the odds of over 50k income by 4%, with all other variables constant. However, if the age is ‘senior’, the one unit increase in working hours would lead to an increase of 2% in odds.
+
+```{r, echo=FALSE, out.width="45%", warning=FALSE, message=FALSE,error=FALSE}
+dotplot(ranef(model_final, condVar=TRUE),cex.axis = 0.7, cex.lab= 1.2)$country
+```
+
+The **random intercept helps to explain variations across native countries**. The cross-country variation attributed to the random intercept of ‘country’ is 0.377. The dotplot shows that **different native countries have different intercepts (Q3)**. Among all countries, only the confidence interval of ‘mexico’ and ‘united states’ did’t include the 0 intercept, which were different from other countries. This makes sense because the income census was based on the United States and those whose's native countries are the United States or Mexico have fewer policy restrictions concerning the job market. 
+
+### limitations
+There are also some potential limitations of the study. Firstly, the income census is not the latest years, there might be some change in the job market and policy. Besides, though it's within a reasonable scale, the data is **not quite balanced** for positive and negative observations. The number of positive observations are about 3 times of the negative.
